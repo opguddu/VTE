@@ -1,0 +1,783 @@
+import logging
+import sys
+import time
+from difflib import SequenceMatcher
+
+import pytesseract
+import pyttsx3
+from PIL import ImageGrab, ImageEnhance
+from PyQt5.QtCore import Qt, QRect, QThread, pyqtSignal, QMutex, QMutexLocker
+from PyQt5.QtGui import QPainter, QPen, QGuiApplication, QFont, QColor, QLinearGradient, QBrush
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QPushButton, QTextEdit, QVBoxLayout, QHBoxLayout,
+    QMessageBox, QFileDialog, QLabel, QStyle, QStatusBar, QComboBox, QProgressBar
+)
+
+# Set the path to the Tesseract executable
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filename="text_extractor.log"
+)
+
+
+# Improved translator class to handle async translations
+class SafeTranslator:
+    def __init__(self):
+        self.translator = None
+        self.deep_translator = False  # Flag to indicate which library we're using
+
+    def translate(self, text, dest='en'):
+        if not text:
+            return type('obj', (object,), {'text': ''})
+
+        try:
+            # Try to use deep-translator first (more reliable)
+            if self.translator is None:
+                try:
+                    from deep_translator import GoogleTranslator
+                    self.deep_translator = True
+                except ImportError:
+                    # Fall back to googletrans if deep-translator is not available
+                    from googletrans import Translator
+                    self.translator = Translator()
+                    self.deep_translator = False
+
+            # Use the appropriate translation method
+            if self.deep_translator:
+                from deep_translator import GoogleTranslator
+                translated_text = GoogleTranslator(source='auto', target=dest).translate(text)
+                return type('obj', (object,), {'text': translated_text})
+            else:
+                # Handle potential async nature of googletrans
+                try:
+                    result = self.translator.translate(text, dest=dest)
+                    return result
+                except (TypeError, AttributeError) as e:
+                    # If it's an async error, try to handle it
+                    if "coroutine" in str(e):
+                        import asyncio
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except RuntimeError:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                        result = loop.run_until_complete(self.translator.translate(text, dest=dest))
+                        return result
+                    else:
+                        raise
+
+        except Exception as e:
+            logging.error(f"Translation error: {e}")
+            # Return an object with the same text to handle the error gracefully
+            return type('obj', (object,), {'text': f"Translation failed: {str(e)[:100]}"})
+
+
+class TranslateThread(QThread):
+    translation_completed = pyqtSignal(str)
+    translation_progress = pyqtSignal(int)
+    translation_error = pyqtSignal(str)
+
+    def __init__(self, text, dest_lang, translator):
+        super().__init__()
+        self.text = text
+        self.dest_lang = dest_lang
+        self.translator = translator
+
+    def run(self):
+        try:
+            self.translation_progress.emit(30)  # Starting progress
+            translated = self.translator.translate(self.text, dest=self.dest_lang)
+            self.translation_progress.emit(90)  # Almost complete
+
+            if hasattr(translated, 'text'):
+                self.translation_completed.emit(translated.text)
+            else:
+                self.translation_error.emit("Translation failed: Invalid response format")
+
+        except Exception as e:
+            logging.error(f"Translation Error: {e}")
+            self.translation_error.emit(f"Translation failed: {str(e)[:100]}")
+        finally:
+            self.translation_progress.emit(100)  # Complete
+
+
+class ScreenCapture(QWidget):
+    area_selected = pyqtSignal(int, int, int, int)
+
+    def __init__(self):
+        super().__init__()
+        self.start_x = self.start_y = self.end_x = self.end_y = 0
+        self.selecting = False
+        self.setGeometry(QGuiApplication.primaryScreen().geometry())
+        self.setWindowTitle("Select Area")
+        self.setWindowOpacity(0.3)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setCursor(Qt.CrossCursor)
+        self.showFullScreen()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.start_x, self.start_y = event.x(), event.y()
+            self.selecting = True
+
+    def mouseMoveEvent(self, event):
+        if self.selecting:
+            self.end_x, self.end_y = event.x(), event.y()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.selecting = False
+            # Ensure we have valid coordinates (normalize if needed)
+            x1, x2 = min(self.start_x, self.end_x), max(self.start_x, self.end_x)
+            y1, y2 = min(self.start_y, self.end_y), max(self.start_y, self.end_y)
+
+            # Only emit if we have a valid area (not just a click)
+            if x2 - x1 > 10 and y2 - y1 > 10:
+                self.hide()
+                self.area_selected.emit(x1, y1, x2, y2)
+            else:
+                QMessageBox.warning(self, "Warning", "Selected area is too small. Please try again.")
+
+    def paintEvent(self, event):
+        if self.selecting:
+            painter = QPainter(self)
+            painter.setPen(QPen(Qt.red, 2, Qt.SolidLine))
+            painter.setBrush(QColor(255, 0, 0, 50))
+            painter.drawRect(QRect(self.start_x, self.start_y, self.end_x - self.start_x, self.end_y - self.start_y))
+
+
+class OCRThread(QThread):
+    text_extracted = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, x1, y1, x2, y2):
+        super().__init__()
+        self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
+        self.running = True
+        self.paused = False
+        self.previous_text = ""
+        self.mutex = QMutex()
+        self.consecutive_failures = 0
+        self.max_failures = 5
+
+    def run(self):
+        while self.running:
+            try:
+                with QMutexLocker(self.mutex):
+                    if not self.running:
+                        break
+
+                    if self.paused:
+                        time.sleep(0.5)  # Sleep when paused to reduce CPU usage
+                        continue
+
+                # Get screen area safely
+                try:
+                    bbox = (self.x1, self.y1, self.x2, self.y2)
+                    img = ImageGrab.grab(bbox)
+
+                    if img:
+                        img = img.convert('L')  # Convert to grayscale
+                        img = ImageEnhance.Contrast(img).enhance(2.0)  # Enhance contrast
+
+                        text = pytesseract.image_to_string(img, config='--psm 6').strip()  # Use PSM 6 for block of text
+
+                        if text and self.is_significant_change(self.previous_text, text):
+                            self.previous_text = text
+                            self.text_extracted.emit(text)
+                            self.consecutive_failures = 0
+                    else:
+                        logging.warning("Failed to capture screen area")
+
+                except Exception as e:
+                    self.consecutive_failures += 1
+                    error_msg = f"OCR Error: {str(e)}"
+                    logging.error(error_msg)
+
+                    # If we have too many consecutive failures, report to UI
+                    if self.consecutive_failures >= self.max_failures:
+                        self.error_occurred.emit(f"Multiple OCR failures: {str(e)}")
+                        time.sleep(5)  # Wait longer before retrying
+
+                time.sleep(1)  # Reduce CPU usage
+
+            except Exception as e:
+                logging.error(f"Thread error: {e}")
+                time.sleep(1)  # Sleep on error to prevent crash loops
+
+    def is_significant_change(self, old_text, new_text, threshold=0.85):
+        # Check if the new text is significantly different from the old text
+        if not old_text or not new_text:
+            return True
+        return SequenceMatcher(None, old_text, new_text).ratio() < threshold
+
+    def stop(self):
+        with QMutexLocker(self.mutex):
+            self.running = False
+        self.wait(3000)  # Wait up to 3 seconds for thread to finish
+
+    def toggle_pause(self):
+        with QMutexLocker(self.mutex):
+            self.paused = not self.paused
+        return self.paused
+
+
+class TTSThread(QThread):
+    finished = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+    progress = pyqtSignal(int)
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+        self.running = True
+        self.engine = None
+
+    def run(self):
+        try:
+            self.progress.emit(10)
+            self.engine = pyttsx3.init()
+            self.progress.emit(30)
+
+            if self.text and self.running:
+                # Split text into manageable chunks if very large
+                if len(self.text) > 5000:
+                    chunks = self.split_text_into_chunks(self.text)
+                    total_chunks = len(chunks)
+
+                    for i, chunk in enumerate(chunks):
+                        if not self.running:
+                            break
+                        self.engine.say(chunk)
+                        self.engine.runAndWait()
+                        # Update progress based on chunks processed
+                        progress = 30 + int(60 * (i + 1) / total_chunks)
+                        self.progress.emit(progress)
+                else:
+                    self.engine.say(self.text)
+                    self.progress.emit(50)
+                    self.engine.runAndWait()
+                    self.progress.emit(90)
+
+        except Exception as e:
+            logging.error(f"TTS Error: {e}")
+            self.error_occurred.emit(f"TTS Error: {str(e)}")
+        finally:
+            self.progress.emit(100)
+            self.finished.emit()
+
+    def split_text_into_chunks(self, text, max_length=1000):
+        """Split text into smaller chunks at sentence boundaries"""
+        chunks = []
+        sentences = text.replace('!', '.').replace('?', '.').split('.')
+        current_chunk = ""
+
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) < max_length:
+                current_chunk += sentence + ". "
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = sentence + ". "
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    def stop(self):
+        self.running = False
+        if self.engine:
+            try:
+                self.engine.stop()
+            except:
+                pass  # Ignore errors when stopping
+
+
+class TextExtractorApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("All In One Text Extractor")
+        self.setGeometry(763, 31, 600, 300)
+        self.setStyleSheet("""
+            background-color: #f0f0f0;
+            font-family: Arial;
+        """)
+        self.layout = QVBoxLayout()
+        self.init_ui()
+        self.ocr_thread = None
+        self.tts_thread = None
+        self.translate_thread = None
+        self.reading = False
+        self.translating = False
+        self.translator = SafeTranslator()
+
+        # Add application recovery handling
+        self.last_crash_time = 0
+        self.crash_count = 0
+
+        self.is_dark_mode = False
+
+    # Modified init_ui method with background colors
+    def init_ui(self):
+        # Main application background
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #e0f7fa;
+                font-family: Arial;
+            }
+        """)
+
+        # Header
+        header = QLabel("All In One Text Extractor")
+        header.setFont(QFont('Arial', 24, QFont.Bold))
+        header.setAlignment(Qt.AlignCenter)
+        header.setStyleSheet("""
+            color: #006064; 
+            margin-bottom: 20px;
+            background-color: #b2ebf2;
+            padding: 10px;
+            border-radius: 8px;
+        """)
+        self.layout.addWidget(header)
+
+        # Horizontal container for text fields
+        text_fields_layout = QHBoxLayout()
+
+        # Extracted Text Column
+        extracted_column = QVBoxLayout()
+        text_label = QLabel("Extracted Text:")
+        text_label.setFont(QFont('Arial', 12))
+        text_label.setStyleSheet("background-color: #80deea; padding: 5px; border-radius: 5px;")
+        extracted_column.addWidget(text_label)
+        self.text_edit = QTextEdit(self)
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(QFont('Courier', 12))
+        self.text_edit.setStyleSheet("""
+            background-color: #e1f5fe;
+            border: 2px solid #4fc3f7;
+            padding: 10px;
+            border-radius: 10px;
+        """)
+        extracted_column.addWidget(self.text_edit)
+        text_fields_layout.addLayout(extracted_column)
+
+        # Translated Text Column
+        translated_column = QVBoxLayout()
+        translated_label = QLabel("Translated Text:")
+        translated_label.setFont(QFont('Arial', 12))
+        translated_label.setStyleSheet("background-color: #80deea; padding: 5px; border-radius: 5px;")
+        translated_column.addWidget(translated_label)
+        self.translated_text_edit = QTextEdit(self)
+        self.translated_text_edit.setReadOnly(True)
+        self.translated_text_edit.setFont(QFont('Courier', 12))
+        self.translated_text_edit.setStyleSheet("""
+            background-color: #e8f5e9;
+            border: 2px solid #81c784;
+            padding: 10px;
+            border-radius: 10px;
+        """)
+        translated_column.addWidget(self.translated_text_edit)
+        text_fields_layout.addLayout(translated_column)
+
+        self.layout.addLayout(text_fields_layout)
+
+        # Progress Bar
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #00acc1;
+                border-radius: 5px;
+                text-align: center;
+                background-color: #e0f7fa;
+            }
+            QProgressBar::chunk {
+                background-color: #00acc1;
+            }
+        """)
+        self.layout.addWidget(self.progress_bar)
+
+        # Language Selection Dropdown
+        lang_layout = QHBoxLayout()
+        lang_label = QLabel("Target Language:")
+        lang_label.setStyleSheet("background-color: #80deea; padding: 5px; border-radius: 5px;")
+        lang_layout.addWidget(lang_label)
+
+        self.language_combo = QComboBox(self)
+        self.language_combo.addItems([
+            "en - English",
+            "hi - Hindi",
+            "mr - Marathi",
+            "es - Spanish",
+            "fr - French",
+            "de - German",
+            "zh-cn - Chinese",
+            "ja - Japanese",
+            "ko - Korean",
+            "ru - Russian",
+            "it - Italian",
+            "pt - Portuguese"
+        ])
+        self.language_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #e1f5fe;
+                border: 2px solid #4fc3f7;
+                padding: 5px;
+                border-radius: 5px;
+            }
+            QComboBox::drop-down {
+                background-color: #4fc3f7;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #e1f5fe;
+                selection-background-color: #4fc3f7;
+            }
+        """)
+        lang_layout.addWidget(self.language_combo)
+        self.layout.addLayout(lang_layout)
+
+        # Buttons with updated colors
+        self.button_layout = QHBoxLayout()
+
+        self.extract_btn = QPushButton("Select Area & Start Extraction", self)
+        self.extract_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        self.extract_btn.setToolTip("Select an area on the screen to start text extraction")
+        self.extract_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #26a69a;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #00897b;
+            }
+        """)
+        self.extract_btn.clicked.connect(self.start_selection)
+        self.button_layout.addWidget(self.extract_btn)
+
+        self.pause_btn = QPushButton("Pause", self)
+        self.pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+        self.pause_btn.setToolTip("Pause or resume text extraction")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ef5350;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #e53935;
+            }
+            QPushButton:disabled {
+                background-color: #ffcdd2;
+                color: #b71c1c;
+            }
+        """)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.button_layout.addWidget(self.pause_btn)
+
+        self.read_btn = QPushButton("Read Aloud", self)
+        self.read_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.read_btn.setToolTip("Read the extracted text aloud")
+        self.read_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #42a5f5;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #1e88e5;
+            }
+        """)
+        self.read_btn.clicked.connect(self.toggle_read_aloud)
+        self.button_layout.addWidget(self.read_btn)
+
+        self.translate_btn = QPushButton("Translate", self)
+        self.translate_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.translate_btn.setToolTip("Translate the extracted text")
+        self.translate_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ffb74d;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #ff9800;
+            }
+        """)
+        self.translate_btn.clicked.connect(self.translate_text)
+        self.button_layout.addWidget(self.translate_btn)
+
+        self.copy_btn = QPushButton("Copy to Clipboard", self)
+        self.copy_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogContentsView))
+        self.copy_btn.setToolTip("Copy the extracted text to clipboard")
+        self.copy_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ab47bc;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #9c27b0;
+            }
+        """)
+        self.copy_btn.clicked.connect(self.copy_text)
+        self.button_layout.addWidget(self.copy_btn)
+
+        self.save_btn = QPushButton("Save to File", self)
+        self.save_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.save_btn.setToolTip("Save the extracted text to a file")
+        self.save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #78909c;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #607d8b;
+            }
+        """)
+        self.save_btn.clicked.connect(self.save_text)
+        self.button_layout.addWidget(self.save_btn)
+
+        self.clear_btn = QPushButton("Clear Text", self)
+        self.clear_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        self.clear_btn.setToolTip("Clear the text area")
+        self.clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ec407a;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #d81b60;
+            }
+        """)
+        self.clear_btn.clicked.connect(self.clear_text)
+        self.button_layout.addWidget(self.clear_btn)
+
+        self.layout.addLayout(self.button_layout)
+
+        # Status Bar with background
+        self.status_bar = QStatusBar()
+        self.status_bar.showMessage("Ready")
+        self.status_bar.setStyleSheet("""
+            QStatusBar {
+                background-color: #b2ebf2;
+                border-top: 1px solid #00acc1;
+                padding: 3px;
+            }
+        """)
+        self.layout.addWidget(self.status_bar)
+
+        self.setLayout(self.layout)
+    def start_selection(self):
+        try:
+            self.capture_window = ScreenCapture()
+            self.capture_window.area_selected.connect(self.start_extraction)
+            self.status_bar.showMessage("Select an area on the screen...")
+        except Exception as e:
+            self.show_error(f"Failed to start screen capture: {e}")
+
+    def start_extraction(self, x1, y1, x2, y2):
+        try:
+            if self.ocr_thread:
+                self.ocr_thread.stop()
+                self.ocr_thread.wait()
+
+            self.ocr_thread = OCRThread(x1, y1, x2, y2)
+            self.ocr_thread.text_extracted.connect(self.append_text)
+            self.ocr_thread.error_occurred.connect(self.show_error)
+            self.ocr_thread.start()
+            self.pause_btn.setEnabled(True)
+            self.status_bar.showMessage("Extraction started...")
+        except Exception as e:
+            self.show_error(f"Failed to start extraction: {e}")
+
+    def append_text(self, text):
+        if text:
+            self.text_edit.append(text)  # Append new text
+            self.status_bar.showMessage("New text appended")
+
+    def toggle_pause(self):
+        if self.ocr_thread:
+            paused = self.ocr_thread.toggle_pause()
+            self.pause_btn.setText("Resume" if paused else "Pause")
+            self.status_bar.showMessage("Extraction paused" if paused else "Extraction resumed")
+
+    def toggle_read_aloud(self):
+        # If already reading, stop current reading
+        if self.reading:
+            self.reading = False
+            if self.tts_thread:
+                self.tts_thread.stop()
+                self.tts_thread.wait(1000)  # Wait up to 1 second for thread to finish
+            self.read_btn.setText("Read Aloud")
+            self.progress_bar.setVisible(False)
+            return
+
+        # Start new reading
+        text = self.text_edit.toPlainText()
+        if not text:
+            self.status_bar.showMessage("No text to read")
+            return
+
+        self.reading = True
+        self.read_btn.setText("Stop Reading")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+
+        # Create and start TTS thread
+        self.tts_thread = TTSThread(text)
+        self.tts_thread.finished.connect(self.on_tts_finished)
+        self.tts_thread.error_occurred.connect(self.show_error)
+        self.tts_thread.progress.connect(self.update_progress)
+        self.tts_thread.start()
+
+    def on_tts_finished(self):
+        self.reading = False
+        self.read_btn.setText("Read Aloud")
+        self.progress_bar.setVisible(False)
+        self.status_bar.showMessage("Reading completed")
+
+    def translate_text(self):
+        # If already translating, don't start another translation
+        if self.translating:
+            return
+
+        text = self.text_edit.toPlainText()
+        if not text:
+            self.status_bar.showMessage("No text to translate")
+            return
+
+        try:
+            # Extract language code from combobox text (e.g., "en - English" -> "en")
+            target_lang = self.language_combo.currentText().split(" ")[0]
+
+            self.translating = True
+            self.translate_btn.setEnabled(False)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(10)
+            self.status_bar.showMessage(f"Translating to {target_lang}...")
+
+            # Create and start translation thread
+            self.translate_thread = TranslateThread(text, target_lang, self.translator)
+            self.translate_thread.translation_completed.connect(self.on_translation_completed)
+            self.translate_thread.translation_error.connect(self.show_error)
+            self.translate_thread.translation_progress.connect(self.update_progress)
+            self.translate_thread.start()
+
+        except Exception as e:
+            logging.error(f"Translation Error: {e}")
+            self.status_bar.showMessage(f"Translation failed: {str(e)[:100]}")
+            self.translating = False
+            self.translate_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+
+    def on_translation_completed(self, translated_text):
+        self.translated_text_edit.setPlainText(translated_text)
+        self.status_bar.showMessage(f"Text translated successfully")
+        self.translating = False
+        self.translate_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+    def update_progress(self, value):
+        self.progress_bar.setValue(value)
+
+    def copy_text(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.text_edit.toPlainText())
+        self.status_bar.showMessage("Text copied to clipboard")
+
+    def save_text(self):
+        try:
+            filename, _ = QFileDialog.getSaveFileName(self, "Save File", "", "Text Files (*.txt)")
+            if filename:
+                with open(filename, 'w', encoding='utf-8') as file:
+                    file.write(self.text_edit.toPlainText())
+                self.status_bar.showMessage(f"Text saved to {filename}")
+        except Exception as e:
+            self.show_error(f"Failed to save file: {e}")
+
+    def clear_text(self):
+        reply = QMessageBox.question(
+            self,
+            "Clear Text",
+            "Are you sure you want to clear the text?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.text_edit.clear()
+            self.translated_text_edit.clear()
+            self.status_bar.showMessage("Text cleared")
+
+    def show_error(self, message):
+        logging.error(message)
+        QMessageBox.warning(self, "Error", message)
+        self.status_bar.showMessage(f"Error: {message[:50]}...")
+
+    def closeEvent(self, event):
+        try:
+            # Properly stop all threads
+            if self.ocr_thread:
+                self.ocr_thread.stop()
+
+            if self.tts_thread and self.tts_thread.isRunning():
+                self.tts_thread.stop()
+
+            if self.translate_thread and self.translate_thread.isRunning():
+                self.translate_thread.terminate()
+
+            # Wait for threads to finish (with timeout)
+            if self.ocr_thread:
+                self.ocr_thread.wait(1000)
+
+            if self.tts_thread:
+                self.tts_thread.wait(1000)
+
+            if self.translate_thread:
+                self.translate_thread.wait(1000)
+
+            event.accept()
+        except Exception as e:
+            logging.error(f"Error during application close: {e}")
+            event.accept()  # Accept the close event anyway
+
+
+def exception_hook(exctype, value, traceback):
+    """Global exception handler to log uncaught exceptions"""
+    logging.error(f"Uncaught exception: {exctype}, {value}", exc_info=(exctype, value, traceback))
+    sys.__excepthook__(exctype, value, traceback)
+
+
+if __name__ == "__main__":
+    # Set up global exception handler
+    sys.excepthook = exception_hook
+
+    # Create and run application
+    app = QApplication(sys.argv)
+    window = TextExtractorApp()
+    window.show()
+    sys.exit(app.exec_())

@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Binary executables and large archives
+*.exe
+*.zip
+*.pdf
+
+# C extensions
+*.so
+
+# Distribution / packaging
+dist/
+dist_installer/
+release_artifacts/
+build/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller intermediate files
+*.manifest
+*.spec.bak
+*.toc
+*.pyz
+warn-*.txt
+xref-*.html
+localpycs/
+
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Application logs and local runtime configurations
+*.log
+text_extractor.log
+vte_config.json
+.write_test
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Temporary files
+*.tmp
+test_frame.png
+test_prep.png

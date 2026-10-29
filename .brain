@@ -1,0 +1,87 @@
+# .BRAIN - VTE Project Intelligence & Persistent Memory
+
+> **IMPORTANT**: This file stores the complete codebase architecture, components, and update log for VTE. Read this file at the start of any conversation to instantly understand everything without needing to re-analyze all files repeatedly.
+
+---
+
+## 1. Project Identity & Overview
+- **Project Name**: VTE (Video Text Extractor / All In One Text Extractor)
+- **Primary Entry File**: VTE.py (and AIOTE.py mirror)
+- **Standalone App Executable**: dist/VTE/VTE.exe
+- **Windows Setup Installer**: release_artifacts/VideoTextExtractor_Setup.exe (78.4 MB, Inno Setup 6)
+- **Portable Distribution Zip**: release_artifacts/VideoTextExtractor-Portable-x64.zip (116.8 MB, Zero-dependency)
+- **Technology Stack**:
+  - GUI Framework: PyQt5 (Widgets, Signals & Slots, Multi-threading via QThread)
+  - OCR Engine: pytesseract + Pillow (ImageGrab, ImageEnhance) + Embedded Portable Tesseract-OCR v5.4.1
+  - Translation: deep-translator (GoogleTranslator) with fallback to googletrans
+  - Voice / TTS: pyttsx3 (native Windows SAPI5)
+  - Packaging: PyInstaller 6.12 (VTE.spec, app.ico) + Inno Setup 6 (installer.iss)
+
+---
+
+## 2. Architecture & Component Hierarchy
+
+### TextExtractorApp(QWidget) (Main Controller Window)
+- Dual-pane display: Left: Extracted Text (self.text_edit), Right: Translated Text (self.translated_text_edit).
+- Target Language selector: QComboBox with Marathi, Hindi, English, Spanish, French, German, Chinese, Japanese, etc.
+- Action Buttons:
+  - Select Area & Start Extraction -> start_selection()
+  - Pause/Resume -> toggle_pause()
+  - Read Aloud/Stop -> toggle_read_aloud()
+  - Translate -> translate_text()
+  - Copy -> copy_text()
+  - Save -> save_text() (Safely defaults to Documents folder)
+  - Clear -> clear_text()
+- Status Bar & Progress Bar for visual feedback.
+- Clean shutdown handler in closeEvent (gracefully stops OCR, TTS, Translation threads).
+
+### ScreenCapture(QWidget)
+- Full-screen transparent overlay (opacity: 0.3, FramelessWindowHint, WindowStaysOnTopHint, CrossCursor).
+- Captures mouse press, drag, and release to emit area_selected(x1, y1, x2, y2).
+
+### OCRThread(QThread)
+- Runs continuous loop over bounding box (x1, y1, x2, y2) with ImageGrab.grab().
+- Pre-processing: converts to grayscale ('L') and enhances contrast (factor: 2.0).
+- OCR engine: pytesseract.image_to_string(img, config='--psm 6').
+- Intelligent diffing: is_significant_change uses difflib.SequenceMatcher (<0.85 threshold) to prevent redundant UI updates.
+- Thread-safe pause/resume with QMutex & QMutexLocker.
+
+### TTSThread(QThread)
+- Background speech engine using pyttsx3.
+- Splits large text into sentence chunks (max 1000 characters) to avoid buffer freezes.
+- Emits real-time progress (progress(int)).
+
+### TranslateThread(QThread) & SafeTranslator
+- Handles asynchronous text translation.
+- SafeTranslator prioritizes deep_translator.GoogleTranslator and falls back to googletrans.Translator.
+
+### Dynamic Tesseract OCR Auto-Discovery
+- Function detect_tesseract() checks:
+  1. Bundled portable Tesseract (_internal/Tesseract-OCR or adjacent Tesseract-OCR) -> Sets TESSDATA_PREFIX automatically!
+  2. User-saved config in vte_config.json
+  3. shutil.which("tesseract") (system PATH)
+  4. Standard Windows paths (C:\Program Files\Tesseract-OCR\tesseract.exe, LocalAppData, etc.)
+- GUI Fallback check_tesseract_available() prompts user with download link & file picker dialog if not found.
+
+### Safe User Data Storage
+- Function get_writable_data_dir() handles:
+  1. Portable mode: saves logs and config in exe directory when directory is writable and not in Program Files.
+  2. Installed mode: saves logs and config in `%APPDATA%\VideoTextExtractor`, preventing Windows permission errors.
+
+---
+
+## 3. Packaging & Distribution Artifacts
+- **Installer**: `release_artifacts/VideoTextExtractor_Setup.exe` (78.4 MB)
+  - Generated via `build_installer.bat` and `installer.iss`.
+  - Configured with Start Menu shortcut, Desktop shortcut, and clean uninstaller.
+  - Silent install/uninstall tested and verified.
+- **Portable ZIP**: `release_artifacts/VideoTextExtractor-Portable-x64.zip` (116.8 MB)
+  - Standalone directory containing `VTE.exe`, `_internal` (with bundled Tesseract OCR), `app.ico`, `Create Desktop Shortcut.bat`, and `README_PORTABLE.txt`.
+- **Developer Scripts**:
+  - `run.bat`: 1-click execution from source with automatic `.venv` setup.
+  - `build_standalone.bat`: 1-click PyInstaller compilation.
+  - `build_installer.bat`: 1-click Inno Setup compilation + ZIP packaging.
+- **Specification Files**:
+  - `VTE.spec`: Path-independent PyInstaller spec using `os.path.abspath(SPECPATH)`.
+  - `installer.iss`: Inno Setup 6 compilation script.
+  - `.gitignore`: Rules for clean repository tracking.
